@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const Expr = union(enum) {
-    Variable: []const u8,
+    Variable: usize,
     Application: struct {
         lhs: *Expr,
         rhs: *Expr,
@@ -14,9 +14,10 @@ pub const Expr = union(enum) {
     pub fn init(allocator: std.mem.Allocator, input: []const u8) !*Expr {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
-        var parser = Parser{ .arena = &arena, .input = input, .pos = 0 };
-        const expr = try parser.parseTerm();
-        return expr;
+        var ctx = std.ArrayList([]const u8).init(allocator);
+        defer ctx.deinit();
+        var parser = Parser{ .arena = &arena, .input = input, .pos = 0, .context = &ctx };
+        return try parser.parseTerm();
     }
 
     pub fn deinit(self: *Expr, arena: *std.heap.ArenaAllocator) void {
@@ -32,7 +33,7 @@ pub const Expr = union(enum) {
                 const rhs = try app.rhs.reduce(arena);
 
                 if (lhs.* == .Lambda) {
-                    return try substitute(lhs.Lambda.body, lhs.Lambda.name, rhs, arena);
+                    return try substitute(lhs.Lambda.body, 0, rhs, arena);
                 }
 
                 const new = try arena.allocator().create(Expr);
@@ -48,26 +49,53 @@ pub const Expr = union(enum) {
         }
     }
 
-    fn substitute(expr: *Expr, name: []const u8, value: *Expr, arena: *std.heap.ArenaAllocator) !*Expr {
+    fn substitute(expr: *Expr, idx: usize, value: *Expr, arena: *std.heap.ArenaAllocator) !*Expr {
         switch (expr.*) {
-            .Variable => |v| {
-                if (std.mem.eql(u8, v, name)) {
-                    return value;
-                }
-                return expr;
+            .Variable => |i| {
+                if (i == idx) return value;
+                const newIndex = if (i > idx) i - 1 else i;
+                const v = try arena.allocator().create(Expr);
+                v.* = .{ .Variable = newIndex };
+                return v;
             },
             .Application => |app| {
-                const lhs = try substitute(app.lhs, name, value, arena);
-                const rhs = try substitute(app.rhs, name, value, arena);
+                const lhs = try substitute(app.lhs, idx, value, arena);
+                const rhs = try substitute(app.rhs, idx, value, arena);
                 const new = try arena.allocator().create(Expr);
                 new.* = .{ .Application = .{ .lhs = lhs, .rhs = rhs } };
                 return new;
             },
             .Lambda => |lam| {
-                const body = try substitute(lam.body, name, value, arena);
+                const shifted = try shift(lam.body, 1, 0, arena);
+                const body = try substitute(shifted, idx + 1, shifted, arena);
                 const new = try arena.allocator().create(Expr);
                 new.* = .{ .Lambda = .{ .name = lam.name, .body = body } };
                 return new;
+            },
+        }
+    }
+
+    fn shift(e: *Expr, d: usize, c: usize, arena: *std.heap.ArenaAllocator) !*Expr {
+        switch (e.*) {
+            .Variable => |i| {
+                const ni = if (i < c) i else i + d;
+                const v = try arena.allocator().create(Expr);
+                v.* = .{ .Variable = ni };
+                return v;
+            },
+            .Application => |app| {
+                const lhs = try shift(app.lhs, d, c, arena);
+                const rhs = try shift(app.rhs, d, c, arena);
+                const a = try arena.allocator().create(Expr);
+                a.* = .{ .Application = .{ .lhs = lhs, .rhs = rhs } };
+                return a;
+            },
+            .Lambda => |lam| {
+                // bump cutoff for nested scope
+                const body = try shift(lam.body, d, c + 1, arena);
+                const l = try arena.allocator().create(Expr);
+                l.* = .{ .Lambda = .{ .name = lam.name, .body = body } };
+                return l;
             },
         }
     }
@@ -84,6 +112,7 @@ const Parser = struct {
     arena: *std.heap.ArenaAllocator,
     input: []const u8,
     pos: usize,
+    context: *std.ArrayList([]const u8),
 
     fn peek(self: *Parser) ?u8 {
         return if (self.pos < self.input.len) self.input[self.pos] else null;
@@ -114,10 +143,8 @@ const Parser = struct {
     fn parseVariable(self: *Parser) ParseError!*Expr {
         self.skipWhitespace();
         const start = self.pos;
-        if (!std.ascii.isLower(self.peek() orelse return ParseError.UnexpectedEOF))
-            return ParseError.InvalidVariable;
+        _ = self.consume() orelse return ParseError.UnexpectedEOF;
 
-        _ = self.consume();
         while (self.peek()) |ch| {
             if (std.ascii.isAlphanumeric(ch)) {
                 _ = self.consume();
@@ -127,53 +154,107 @@ const Parser = struct {
         }
 
         const name = self.input[start..self.pos];
-        const expr = try self.arena.allocator().create(Expr);
-        expr.* = .{ .Variable = name };
-        return expr;
+
+        // look up De Bruijn index in context
+        var found: ?usize = null;
+        for (self.context.items, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name)) {
+                found = i;
+                break;
+            }
+        }
+
+        const i = found orelse return ParseError.InvalidVariable;
+        const v = try self.arena.allocator().create(Expr);
+        v.* = .{ .Variable = i };
+        return v;
     }
 
     fn parseLambda(self: *Parser) ParseError!*Expr {
-        _ = self.consume(); // skip '\\'
-        const param_expr = try self.parseVariable();
-        const param = param_expr.Variable;
+        _ = self.consume(); // skip '\'
+        const start = self.pos;
+        _ = self.consume() orelse return ParseError.UnexpectedEOF;
+        while (self.peek()) |ch| {
+            if (std.ascii.isAlphanumeric(ch)) {
+                _ = self.consume();
+            } else {
+                break;
+            }
+        }
+        const name = self.input[start..self.pos];
 
         self.skipWhitespace();
         if (self.consume() != '.') return ParseError.UnexpectedChar;
 
+        try self.context.append(name); // push param
         const body = try self.parseTerm();
-        const expr = try self.arena.allocator().create(Expr);
-        expr.* = .{ .Lambda = .{ .name = param, .body = body } };
-        return expr;
+        _ = self.context.pop(); // pop param
+
+        const l = try self.arena.allocator().create(Expr);
+        l.* = .{ .Lambda = .{ .name = name, .body = body } };
+        return l;
     }
 
     fn parseParen(self: *Parser) ParseError!*Expr {
-        _ = self.consume(); // skip '('
-        const term = try self.parseTerm();
-
+        _ = self.consume();
+        const e = try self.parseTerm();
         self.skipWhitespace();
-        if (self.consume() != ')') {
-            return ParseError.UnexpectedChar;
-        }
-
-        return self.parseApplication(term);
+        if (self.consume() != ')') return ParseError.UnexpectedChar;
+        return self.parseApplication(e);
     }
 
     fn parseApplication(self: *Parser, left: *Expr) ParseError!*Expr {
         self.skipWhitespace();
-        const next = self.peek();
-        if (next == null or next == ')') return left;
-
-        const right = try self.parseTerm();
-        const expr = try self.arena.allocator().create(Expr);
-        expr.* = .{ .Application = .{ .lhs = left, .rhs = right } };
-        return self.parseApplication(expr);
+        if (self.peek() == null or self.peek() == ')') return left;
+        const r = try self.parseTerm();
+        const a = try self.arena.allocator().create(Expr);
+        a.* = .{ .Application = .{ .lhs = left, .rhs = r } };
+        return self.parseApplication(a);
     }
 };
 
 test "test" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const expr = try Expr.init(arena.allocator(), "(\\x . x) y");
+    const expr = try Expr.init(arena.allocator(), "\\x . x");
     const reduced = try expr.reduce(&arena);
     try std.testing.expect(@TypeOf(reduced.*) == Expr);
+}
+
+test "identity function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expr = try Expr.init(arena.allocator(), "\\x . x");
+    const reduced = try expr.reduce(&arena);
+    try std.testing.expect(reduced.* == .Lambda);
+    try std.testing.expectEqualStrings("x", reduced.Lambda.name);
+}
+
+test "application" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expr = try Expr.init(arena.allocator(), "(\\x . x) (\\y . y)");
+    const reduced = try expr.reduce(&arena);
+    try std.testing.expect(reduced.* == .Lambda);
+    try std.testing.expectEqualStrings("y", reduced.Lambda.name);
+}
+
+test "nested lambda" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expr = try Expr.init(arena.allocator(), "\\x . \\y . x");
+    const reduced = try expr.reduce(&arena);
+    try std.testing.expect(reduced.* == .Lambda);
+    try std.testing.expectEqualStrings("x", reduced.Lambda.name);
+    try std.testing.expect(reduced.Lambda.body.* == .Lambda);
+    try std.testing.expectEqualStrings("y", reduced.Lambda.body.Lambda.name);
+}
+
+test "beta reduction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const expr = try Expr.init(arena.allocator(), "(\\x . \\y . y) (\\z . z)");
+    const reduced = try expr.reduce(&arena);
+    try std.testing.expect(reduced.* == .Lambda);
+    try std.testing.expectEqualStrings("y", reduced.Lambda.name);
 }
