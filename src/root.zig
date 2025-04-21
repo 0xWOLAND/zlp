@@ -14,13 +14,9 @@ pub const Expr = union(enum) {
     pub fn init(allocator: std.mem.Allocator, input: []const u8) !*Expr {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
-
-        var parser = Parser{
-            .arena = &arena,
-            .input = input,
-            .pos = 0,
-        };
-        return parser.parseTerm();
+        var parser = Parser{ .arena = &arena, .input = input, .pos = 0 };
+        const expr = try parser.parseTerm();
+        return expr;
     }
 
     pub fn deinit(self: *Expr, arena: *std.heap.ArenaAllocator) void {
@@ -28,53 +24,49 @@ pub const Expr = union(enum) {
         arena.deinit();
     }
 
-    pub fn reduce(self: *Expr) !*Expr {
+    pub fn reduce(self: *Expr, arena: *std.heap.ArenaAllocator) !*Expr {
         switch (self.*) {
             .Variable => return self,
             .Application => |app| {
-                const lhs = try app.lhs.reduce();
-                const rhs = try app.rhs.reduce();
+                const lhs = try app.lhs.reduce(arena);
+                const rhs = try app.rhs.reduce(arena);
 
                 if (lhs.* == .Lambda) {
-                    return try substitute(lhs.Lambda.body, lhs.Lambda.name, rhs);
+                    return try substitute(lhs.Lambda.body, lhs.Lambda.name, rhs, arena);
                 }
 
-                const new = try self.arena.allocator().create(Expr);
+                const new = try arena.allocator().create(Expr);
                 new.* = .{ .Application = .{ .lhs = lhs, .rhs = rhs } };
                 return new;
             },
             .Lambda => |lam| {
-                const body = try lam.body.reduce();
-                const expr = try self.arena.allocator().create(Expr);
-                expr.* = .{ .Lambda = .{ .param = lam.name, .body = body } };
+                const body = try lam.body.reduce(arena);
+                const expr = try arena.allocator().create(Expr);
+                expr.* = .{ .Lambda = .{ .name = lam.name, .body = body } };
                 return expr;
             },
         }
     }
 
-    fn substitute(expr: *Expr, name: []const u8, value: *Expr) !*Expr {
+    fn substitute(expr: *Expr, name: []const u8, value: *Expr, arena: *std.heap.ArenaAllocator) !*Expr {
         switch (expr.*) {
             .Variable => |v| {
                 if (std.mem.eql(u8, v, name)) {
                     return value;
                 }
-
-                const new = try expr.arena.allocator().create(Expr);
-                new.* = .{ .Variable = v };
-                return new;
+                return expr;
             },
             .Application => |app| {
-                const lhs = try substitute(app.lhs, name, value);
-                const rhs = try substitute(app.rhs, name, value);
-
-                const new = try expr.arena.allocator().create(Expr);
+                const lhs = try substitute(app.lhs, name, value, arena);
+                const rhs = try substitute(app.rhs, name, value, arena);
+                const new = try arena.allocator().create(Expr);
                 new.* = .{ .Application = .{ .lhs = lhs, .rhs = rhs } };
                 return new;
             },
             .Lambda => |lam| {
-                const body = try substitute(lam.body, name, value);
-                const new = try expr.arena.allocator().create(Expr);
-                new.* = .{ .Lambda = .{ .param = lam.name, .body = body } };
+                const body = try substitute(lam.body, name, value, arena);
+                const new = try arena.allocator().create(Expr);
+                new.* = .{ .Lambda = .{ .name = lam.name, .body = body } };
                 return new;
             },
         }
@@ -150,7 +142,7 @@ const Parser = struct {
 
         const body = try self.parseTerm();
         const expr = try self.arena.allocator().create(Expr);
-        expr.* = .{ .Lambda = .{ .param = param, .body = body } };
+        expr.* = .{ .Lambda = .{ .name = param, .body = body } };
         return expr;
     }
 
@@ -181,7 +173,7 @@ const Parser = struct {
 test "test" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-
     const expr = try Expr.init(arena.allocator(), "(\\x . x) y");
-    try std.testing.expect(@TypeOf(expr.*) == Expr);
+    const reduced = try expr.reduce(&arena);
+    try std.testing.expect(@TypeOf(reduced.*) == Expr);
 }
