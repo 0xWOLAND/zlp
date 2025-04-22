@@ -1,4 +1,4 @@
-# ZLP - Zig Lambda Calculus Parser
+# `zlp` - Zig Lambda Calculus Parser [![CI](https://github.com/0xWOLAND/zlp/actions/workflows/ci.yml/badge.svg)](https://github.com/0xWOLAND/zlp/actions/workflows/ci.yml)
 
 A simple lambda calculus interpreter written in Zig that parses, evaluates, and reduces lambda expressions.
 
