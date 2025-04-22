@@ -12,3 +12,12 @@ A simple lambda calculus interpreter written in Zig that parses, evaluates, and 
 - [application.lambda](./examples/application.lambda)
 - [identity.lambda](./examples/identity.lambda)
 - [nested.lambda](./examples/nested.lambda)
+
+## Usage
+```zig
+zig build run -- examples/<example file>
+```
+To run tests:
+```
+zig build test
+```
